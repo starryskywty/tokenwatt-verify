@@ -10,6 +10,10 @@
 Each round sends one fresh, randomly generated instance of every probe to the endpoint and the same prompt
 to the reference, then compares graded answers, reported token counts, refusals and latency. See README.
 
+Three wire protocols are spoken: OpenAI Chat Completions, Anthropic Messages and OpenAI Responses.
+Pick one per endpoint with EP_API=openai|anthropic|responses (aliases accepted); without it the protocol
+is inferred from the URL.
+
     tokenwatt-verify conform --base-url https://api.example.com --api anthropic --model claude-sonnet-5-5 \
         --key-file ~/.keys/example --prices prices.json [--probes my_bank.py] [--long-context --context-window N]
 
@@ -65,7 +69,7 @@ def run(a) -> int:
                 rec.update({f"{prefix}ok": ok, f"{prefix}detail": detail, f"{prefix}refused": refused, side: d})
             if rec["reply"].get("input_tokens") and rec["ref_reply"].get("input_tokens"):
                 rec["input_token_ratio"] = round(rec["reply"]["input_tokens"] / rec["ref_reply"]["input_tokens"], 4)
-            with out.open("a") as f:
+            with out.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             mark = lambda o, rf, e: "error" if e else "refused" if rf else ("PASS" if o else "fail")  # noqa: E731
             tr = rec.get("input_token_ratio")
@@ -83,7 +87,7 @@ def run(a) -> int:
 
 
 def report(paths: list[Path], as_json: str | None = None) -> int:
-    recs = [json.loads(line) for p in paths for line in Path(p).read_text().splitlines() if line.strip()]
+    recs = [json.loads(line) for p in paths for line in Path(p).read_text(encoding="utf-8").splitlines() if line.strip()]
     v = evaluate(recs)
     print(f"\n{len(recs)} requests · {v['answered_pairs']} answered prompt pairs")
     for f in v["findings"]:
@@ -95,17 +99,26 @@ def report(paths: list[Path], as_json: str | None = None) -> int:
              "inconclusive": "INCONCLUSIVE (not enough answered requests yet)"}[v["overall"]]
     print(f"\n  VERDICT: {label}\n")
     if as_json:
-        Path(as_json).write_text(json.dumps(v, indent=2))
+        Path(as_json).write_text(json.dumps(v, indent=2), encoding="utf-8")
     return {"consistent": 0, "inconclusive": 0, "inconsistent": 2}[v["overall"]]
 
 
 def main(argv=None) -> int:
+    # A Windows console still defaults to a legacy code page (GBK here), and the report prints
+    # ✅ / ❌ / × . Switch the streams to UTF-8 rather than crash on the verdict.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
     ap = argparse.ArgumentParser(prog="tokenwatt-verify", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action="version", version=f"tokenwatt-verify {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="send probes to an endpoint and a reference, compare")
-    r.add_argument("--target", required=True, help="env:<PREFIX>, openrouter:<model>, or a file with URL/KEY/MODEL/API lines")
-    r.add_argument("--reference", required=True, help="the genuine model: openrouter:<vendor/model>, env:<PREFIX> or a file (any OpenAI-compatible server)")
+    r.add_argument("--target", required=True, help="env:<PREFIX>, openrouter:<model>, or a file with URL/KEY/MODEL/API "
+                    "lines (API: openai | anthropic | responses)")
+    r.add_argument("--reference", required=True, help="the genuine model: openrouter:<vendor/model>, env:<PREFIX> or a "
+                    "file (any OpenAI-compatible, Anthropic or Responses server)")
     r.add_argument("--probes", help="path to your own probe bank (Python file defining SUITE)")
     r.add_argument("--kinds", help="comma list of probe kinds to run")
     r.add_argument("--rounds", type=int, default=5)
@@ -144,8 +157,9 @@ def add_conform_parser(sub) -> None:
                        formatter_class=argparse.RawDescriptionHelpFormatter,
                        description="Run the conformance checks against one endpoint; see README for what each proves.")
     c.add_argument("--base-url", required=True, help="Anthropic: the host (…/v1/messages is appended); "
-                   "OpenAI: the base ending in /v1 (…/chat/completions is appended)")
-    c.add_argument("--api", required=True, choices=["anthropic", "openai"])
+                   "OpenAI: the base ending in /v1 (…/chat/completions is appended); "
+                   "Responses: the base ending in /v1 (…/responses is appended)")
+    c.add_argument("--api", required=True, choices=["anthropic", "openai", "responses"])
     c.add_argument("--model", required=True, help="model name exactly as the endpoint lists it")
     k = c.add_mutually_exclusive_group()
     k.add_argument("--key-file", help="file holding the API key (never printed or written to the report)")
@@ -188,7 +202,7 @@ def conform(a) -> int:
     from .conform.runner import Options, run as run_conform
     key = ""
     if a.key_file:
-        key = Path(a.key_file).expanduser().read_text().strip()
+        key = Path(a.key_file).expanduser().read_text(encoding="utf-8").strip()
     elif a.key_env:
         key = os.environ.get(a.key_env, "")
         if not key:

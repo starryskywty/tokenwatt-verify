@@ -1,5 +1,5 @@
-"""The two wire protocols `conform` speaks (Anthropic Messages, OpenAI Chat Completions): request builders and
-one normalized view of a response, streamed or not.
+"""The wire protocols `conform` speaks (Anthropic Messages, OpenAI Chat Completions, OpenAI Responses):
+request builders and one normalized view of a response, streamed or not.
 
 The normalized view keeps what the checks compare: visible text, tool calls (raw arguments and parsed input),
 thinking blocks with their signatures, the finish reason (raw and normalized), usage (prompt tokens including
@@ -18,6 +18,10 @@ FINISH_ANTHROPIC = {"end_turn": "stop", "stop_sequence": "stop_sequence", "max_t
                     "refusal": "refusal", "pause_turn": "pause", "model_context_window_exceeded": "length"}
 FINISH_OPENAI = {"stop": "stop", "length": "length", "tool_calls": "tool_use", "function_call": "tool_use",
                  "content_filter": "refusal"}
+# OpenAI Responses: the status/incomplete_details reason, normalized to the same vocabulary.
+FINISH_RESPONSES = {"stop": "stop", "completed": "stop", "max_output_tokens": "length", "length": "length",
+                    "content_filter": "refusal", "refusal": "refusal", "incomplete": "length",
+                    "tool_use": "tool_use", "function_call": "tool_use"}
 
 
 @dataclass
@@ -110,15 +114,30 @@ def norm_usage_openai(u: dict | None) -> dict | None:
             "output": c, "reasoning": reasoning, "raw": u}
 
 
+def norm_usage_responses(u: dict | None) -> dict | None:
+    """OpenAI Responses usage: input_tokens already includes the cached ones."""
+    if not isinstance(u, dict):
+        return None
+    inp, out = _int(u.get("input_tokens")), _int(u.get("output_tokens"))
+    if inp is None and out is None:
+        return None
+    cached = _int((u.get("input_tokens_details") or {}).get("cached_tokens")) or 0
+    reasoning = _int((u.get("output_tokens_details") or {}).get("reasoning_tokens"))
+    return {"prompt_total": inp or 0, "input_uncached": max(0, (inp or 0) - cached), "cache_read": cached,
+            "cache_write": 0, "output": out, "reasoning": reasoning, "raw": u}
+
+
 class Protocol:
     def __init__(self, api: str, model: str):
-        if api not in ("anthropic", "openai"):
-            raise ValueError("api must be anthropic or openai")
+        if api not in ("anthropic", "openai", "responses"):
+            raise ValueError("api must be anthropic, openai or responses")
         self.api, self.model = api, model
 
     @property
     def path(self) -> str:
-        return "/v1/messages" if self.api == "anthropic" else "/chat/completions"
+        if self.api == "anthropic":
+            return "/v1/messages"
+        return "/responses" if self.api == "responses" else "/chat/completions"
 
     # ---- building ------------------------------------------------------------------------------------
     def user(self, text: str) -> dict:
@@ -127,19 +146,23 @@ class Protocol:
     def tool(self, name: str, description: str, schema: dict) -> dict:
         if self.api == "anthropic":
             return {"name": name, "description": description, "input_schema": schema}
+        if self.api == "responses":
+            return {"type": "function", "name": name, "description": description, "parameters": schema}
         return {"type": "function", "function": {"name": name, "description": description, "parameters": schema}}
 
     def tool_choice(self, kind: str, name: str | None = None):
         if self.api == "anthropic":
             return {"type": "auto"} if kind == "auto" else {"type": "tool", "name": name}
+        if self.api == "responses":
+            return "auto" if kind == "auto" else {"type": "function", "name": name}
         return "auto" if kind == "auto" else {"type": "function", "function": {"name": name}}
 
     def request(self, messages: list, *, system: str | None = None, max_tokens: int = 64, tools: list | None = None,
                 tool_choice=None, stream: bool = False, stop: list | None = None, thinking: dict | None = None,
                 temperature: float | None = None, cache_system: bool = False, model: str | None = None,
                 extra: dict | None = None) -> dict:
-        body: dict = {"model": model or self.model, "max_tokens": max_tokens}
         if self.api == "anthropic":
+            body: dict = {"model": model or self.model, "max_tokens": max_tokens}
             if system is not None:
                 body["system"] = ([{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
                                   if cache_system else system)
@@ -148,7 +171,14 @@ class Protocol:
                 body["stop_sequences"] = stop
             if thinking:
                 body["thinking"] = thinking
+        elif self.api == "responses":
+            # Responses: the system prompt is `instructions`, the budget is `max_output_tokens`,
+            # and there is no stop-sequences parameter.
+            body = {"model": model or self.model, "max_output_tokens": max_tokens, "input": messages}
+            if system is not None:
+                body["instructions"] = system
         else:
+            body = {"model": model or self.model, "max_tokens": max_tokens}
             body["messages"] = ([{"role": "system", "content": system}] if system is not None else []) + messages
             if stop:
                 body["stop"] = stop
@@ -170,6 +200,10 @@ class Protocol:
         """The assistant turn exactly as returned (what a client appends to its history)."""
         if self.api == "anthropic":
             return {"role": "assistant", "content": [dict(b) for b in (res.content or [])]}
+        if self.api == "responses":
+            items = [i for i in (res.content or []) if isinstance(i, dict) and i.get("type") == "message"]
+            return items[0] if items else {"type": "message", "role": "assistant",
+                                           "content": [{"type": "output_text", "text": res.text}]}
         msg = {k: v for k, v in (res.content or {}).items() if v is not None}
         msg["role"] = "assistant"
         return msg
@@ -178,6 +212,8 @@ class Protocol:
         if self.api == "anthropic":
             return [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": tc["id"], "content": content}
                                                  for tc in res.tool_calls]}]
+        if self.api == "responses":
+            return [{"type": "function_call_output", "call_id": tc["id"], "output": content} for tc in res.tool_calls]
         return [{"role": "tool", "tool_call_id": tc["id"], "content": content} for tc in res.tool_calls]
 
     # ---- parsing -------------------------------------------------------------------------------------
@@ -189,7 +225,12 @@ class Protocol:
             return res
         if resp.events:
             res.stream = True
-            (self._anthropic_stream if self.api == "anthropic" else self._openai_stream)(resp, res)
+            if self.api == "anthropic":
+                self._anthropic_stream(resp, res)
+            elif self.api == "responses":
+                self._responses_stream(resp, res)
+            else:
+                self._openai_stream(resp, res)
             return res
         j = resp.json
         err = _error_of(j)
@@ -201,7 +242,12 @@ class Protocol:
                 res.error_message = (resp.text or "")[:300]
             res.error_in_200 = resp.status == 200
             return res
-        (self._anthropic_message if self.api == "anthropic" else self._openai_message)(j, res)
+        if self.api == "anthropic":
+            self._anthropic_message(j, res)
+        elif self.api == "responses":
+            self._responses_message(j, res)
+        else:
+            self._openai_message(j, res)
         return res
 
     # anthropic
@@ -409,6 +455,139 @@ class Protocol:
         self._openai_message({"choices": [{"message": msg, "finish_reason": res.finish_raw}], "usage": usage,
                               "id": res.id, "model": res.model}, res)
         res.shape_problems = []
+        res.usage_in_stream = usage is not None and res.usage is not None
+        res.ok = resp.status == 200 and res.stream_error is None
+
+
+# openai responses
+    def _responses_message(self, j: dict, res: Result) -> None:
+        res.ok = True
+        res.id, res.model = str(j.get("id") or ""), str(j.get("model") or "")
+        output = j.get("output")
+        output = output if isinstance(output, list) else []
+        res.content = output
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            t = item.get("type")
+            if t == "message":
+                for c in item.get("content") or []:
+                    if not isinstance(c, dict):
+                        continue
+                    if c.get("type") == "output_text":
+                        res.text += c.get("text") or ""
+                    elif c.get("type") == "refusal":
+                        res.finish_raw = res.finish_raw or "refusal"
+            elif t == "function_call":
+                raw = item.get("arguments")
+                inp, je = None, None
+                try:
+                    inp = json.loads(raw) if isinstance(raw, str) else raw
+                except ValueError as e:
+                    je = str(e)
+                res.tool_calls.append({"id": item.get("call_id") or item.get("id"), "name": item.get("name"),
+                                       "arguments_raw": raw, "input": inp, "json_error": je})
+        status = j.get("status")
+        if status == "completed":
+            res.finish_raw = res.finish_raw or "stop"
+        elif status == "incomplete":
+            res.finish_raw = res.finish_raw or (j.get("incomplete_details") or {}).get("reason") or "incomplete"
+        elif status == "failed":
+            res.ok = False
+            err = j.get("error") or {}
+            if isinstance(err, dict):
+                res.error_type = str(err.get("type") or err.get("code") or "")
+                res.error_message = str(err.get("message") or "")
+            else:
+                res.error_message = str(err)
+        res.finish = FINISH_RESPONSES.get(res.finish_raw, res.finish_raw)
+        res.usage = norm_usage_responses(j.get("usage"))
+        p = res.shape_problems
+        if not isinstance(j.get("id"), str) or not j.get("id"):
+            p.append("no id")
+        if j.get("object") != "response":
+            p.append(f"object is {j.get('object')!r}, not 'response'")
+        if not isinstance(j.get("model"), str) or not j.get("model"):
+            p.append("no model field")
+        if not output:
+            p.append("no output items")
+        u = j.get("usage")
+        if not isinstance(u, dict) or _int(u.get("input_tokens")) is None or _int(u.get("output_tokens")) is None:
+            p.append("usage.input_tokens / usage.output_tokens missing")
+
+    def _responses_stream(self, resp: Response, res: Result) -> None:
+        items: dict = {}
+        usage = None
+        text = ""
+        for ev in resp.events:
+            d, t = ev["data"], ev["t"]
+            if d == "[DONE]":
+                res.final_event = True
+                continue
+            if not isinstance(d, dict):
+                continue
+            typ = d.get("type")
+            if typ in ("response.created", "response.in_progress", "response.completed", "response.incomplete",
+                       "response.failed"):
+                obj = d.get("response") if isinstance(d.get("response"), dict) else {}
+                res.id = str(obj.get("id") or res.id or "")
+                res.model = obj.get("model") or res.model
+                if isinstance(obj.get("usage"), dict):
+                    usage = obj["usage"]
+                    res.usage_in_stream = True
+                if typ in ("response.completed", "response.incomplete"):
+                    res.final_event = True
+                    res.finish_raw = "stop" if typ == "response.completed" else \
+                        (obj.get("incomplete_details") or {}).get("reason") or "incomplete"
+                elif typ == "response.failed":
+                    res.stream_error = obj.get("error") or obj
+            elif typ == "response.output_item.added":
+                item = d.get("item")
+                items[d.get("output_index", len(items))] = dict(item) if isinstance(item, dict) else {}
+            elif typ == "response.output_item.done":
+                item = d.get("item")
+                idx = d.get("output_index", len(items))
+                merged = dict(items.get(idx) or {})
+                if isinstance(item, dict):
+                    merged.update(item)
+                items[idx] = merged
+            elif typ == "response.output_text.delta":
+                piece = d.get("delta") or ""
+                if piece:
+                    text += piece
+                    res.token_events += 1
+                    if res.t_first_token is None:
+                        res.t_first_token = t
+                    res.t_last_token = t
+                    if res.t_first_text is None:
+                        res.t_first_text = t
+            elif typ == "response.function_call_arguments.delta":
+                piece = d.get("delta") or ""
+                if piece:
+                    idx = d.get("output_index", len(items))
+                    it = items.setdefault(idx, {"type": "function_call", "name": "", "arguments": ""})
+                    it["_args"] = (it.get("_args") or "") + piece
+                    res.token_events += 1
+                    if res.t_first_token is None:
+                        res.t_first_token = t
+                    res.t_last_token = t
+            elif typ == "response.refusal.delta":
+                res.finish_raw = "refusal"
+            elif typ == "error":
+                res.stream_error = d.get("error") or d
+        output = []
+        for i in sorted(items):
+            it = dict(items[i])
+            if not it.get("arguments") and it.get("_args"):
+                it["arguments"] = it.pop("_args")
+            it.pop("_args", None)
+            output.append(it)
+        j = {"id": res.id, "object": "response", "model": res.model, "status": "completed", "output": output,
+             "usage": usage or {}}
+        self._responses_message(j, res)
+        res.shape_problems = []                      # a stream is judged by its events, not by a body shape
+        if text:
+            res.text = text
         res.usage_in_stream = usage is not None and res.usage is not None
         res.ok = resp.status == 200 and res.stream_error is None
 

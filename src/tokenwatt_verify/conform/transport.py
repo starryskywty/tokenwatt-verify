@@ -74,7 +74,7 @@ class Session:
         self.guard = None                      # callable raising BudgetExceeded before a request
         if self.evidence_path:
             self.evidence_path.parent.mkdir(parents=True, exist_ok=True)
-            self.evidence_path.write_text("")
+            self.evidence_path.write_text("", encoding="utf-8")
 
     # ---- URLs and headers ----------------------------------------------------------------------------
     def url(self, path: str) -> str:
@@ -82,6 +82,8 @@ class Session:
             return path
         if self.api == "anthropic" and path == "/v1/messages" and self.base.endswith("/v1"):
             return self.base + "/messages"
+        if self.api == "responses" and path == "/responses":
+            return self.base + ("/responses" if self.base.endswith("/v1") else "/v1/responses")
         return self.base + path
 
     def auth_headers(self, key: str | None) -> dict:

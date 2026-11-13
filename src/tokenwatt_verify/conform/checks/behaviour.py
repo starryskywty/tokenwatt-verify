@@ -124,6 +124,9 @@ def b2(ctx) -> dict:
 # ---------------------------------------------------------------------------------------------------- B3
 def b3(ctx) -> dict:
     p = ctx.proto
+    if p.api == "responses":
+        return check_result("B3", NA, "the Responses protocol has no stop-sequences parameter, so there is nothing "
+                            "for this check to exercise", {"stop": None})
     a, b, c = ctx.rng.randint(3001, 9999), ctx.rng.randint(1001, 9999), ctx.rng.randint(10001, 99999)
     want = str(a * b - c)
     ask = (f"What is {a} × {b} − {c}? Work it out carefully, then reply with only the final number "
@@ -306,7 +309,8 @@ def b6(ctx) -> dict:
     if not rt.stream:
         fails.append("stream=true did not return an event stream")
     if not rt.final_event:
-        fails.append("no final event (" + ("message_stop" if p.api == "anthropic" else "[DONE]") + ")")
+        fails.append("no final event (" + ("message_stop" if p.api == "anthropic" else
+                                          "response.completed" if p.api == "responses" else "[DONE]") + ")")
     if not rt.usage_in_stream:
         fails.append("no usage in the stream")
     if rs.finish != rt.finish:

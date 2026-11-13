@@ -25,7 +25,8 @@ def i1(ctx) -> dict:
                             + (" (an error object returned with HTTP 200)" if r.error_in_200 else ""), d)
     if r.shape_problems:
         return check_result("I1", FAIL, "response is not a well-formed " + ("Anthropic message" if p.api == "anthropic"
-                            else "chat completion") + ": " + "; ".join(r.shape_problems), d)
+                            else "response object" if p.api == "responses" else "chat completion") + ": "
+                            + "; ".join(r.shape_problems), d)
     if not r.text.strip():
         return check_result("I1", FAIL, f"no text in the answer (finish {r.finish_raw!r})", d)
     if not same_model(ctx.opts.model, r.model):
@@ -117,7 +118,8 @@ def i3(ctx) -> dict:
     o, p = ctx.opts, ctx.proto
     if o.api != "anthropic":
         return check_result("I3", NA, "thinking signatures are part of the Anthropic Messages protocol; "
-                            "this endpoint was read in OpenAI format")
+                            + ("this endpoint was read in OpenAI Responses format" if o.api == "responses"
+                               else "this endpoint was read in OpenAI format"))
     if not is_claude(o.model):
         return check_result("I3", NA, f"{o.model!r} is not a Claude model")
     a, b = ctx.rng.randint(101, 999), ctx.rng.randint(11, 99)

@@ -84,7 +84,8 @@ binding on you. A reading of your own endpoint, or one you have permission to te
 
 ```
 --base-url URL          Anthropic: the host (…/v1/messages is appended). OpenAI: the base ending in /v1.
---api anthropic|openai
+                        Responses: the base ending in /v1 (…/responses is appended).
+--api anthropic|openai|responses
 --model NAME            exactly as the endpoint lists it
 --key-file F | --key-env VAR     the key is never printed and never written to the report or evidence
 --auth auto|x-api-key|bearer|both
@@ -198,6 +199,30 @@ llama.cpp) without a key, e.g. a quantized build against the original:
 export EP_URL=http://localhost:8000/v1 EP_MODEL=Qwen/Qwen3-8B-FP8 REF_URL=http://localhost:8001/v1 REF_MODEL=Qwen/Qwen3-8B
 tokenwatt-verify run --target env:EP --reference env:REF --rounds 5
 ```
+
+### Wire protocols
+
+Three protocols are spoken, chosen per endpoint with `<PREFIX>_API` (aliases accepted) or an `API:` line in an
+endpoint file:
+
+| `API` | endpoint | request | usage reported as |
+|---|---|---|---|
+| `openai` (default) | `…/v1/chat/completions` | `messages` | `usage.prompt_tokens` / `completion_tokens` |
+| `anthropic` | `…/v1/messages` | `system` + `messages` | `usage.input_tokens` / `output_tokens` |
+| `responses` | `…/v1/responses` | `instructions` + `input` | `usage.input_tokens` / `output_tokens` |
+
+```
+export EP_URL=https://api.example.com/v1 EP_MODEL=gpt-5 EP_API=responses
+tokenwatt-verify run --target env:EP --reference openrouter:openai/gpt-5 --rounds 5
+```
+
+Without `EP_API` the protocol is inferred from the URL (an Anthropic URL → `anthropic`, a URL ending in
+`/responses` → `responses`, otherwise `openai`). Both streaming and plain JSON answers are accepted, so a
+server that ignores `stream=true` still works. A model that rejects `temperature` (the reasoning ones do)
+is retried once without it.
+
+`conform` takes the same three: `--api anthropic|openai|responses`. The Responses protocol has no
+stop-sequences parameter, so B3 reports `NA` there.
 
 ## Limits
 
